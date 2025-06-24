@@ -4,7 +4,6 @@ import inspect
 import json
 import logging
 import os
-import re
 import shutil
 import sys
 import tempfile
@@ -12,10 +11,12 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from threading import Thread
 from typing import Any, Generic, TypeVar
 
 from dotenv import load_dotenv
+
+from browser_use.agent.llm.service import LLMService
+from browser_use.filesystem.file_system import FileSystem
 
 load_dotenv()
 
@@ -36,12 +37,7 @@ from browser_use.agent.cloud_events import (
 from browser_use.agent.gif import create_history_gif
 from browser_use.agent.memory import Memory, MemoryConfig
 from browser_use.agent.message_manager.service import MessageManager, MessageManagerSettings
-from browser_use.agent.message_manager.utils import (
-	convert_input_messages,
-	extract_json_from_model_output,
-	is_model_without_tool_support,
-	save_conversation,
-)
+from browser_use.agent.message_manager.utils import save_conversation
 from browser_use.agent.prompts import AgentMessagePrompt, PlannerPrompt, SystemPrompt
 from browser_use.agent.views import (
 	ActionResult,
@@ -65,19 +61,29 @@ from browser_use.controller.registry.views import ActionModel
 from browser_use.controller.service import Controller
 from browser_use.dom.history_tree_processor.service import DOMHistoryElement, HistoryTreeProcessor
 from browser_use.exceptions import LLMException
-from browser_use.filesystem.file_system import FileSystem
 from browser_use.sync import CloudSync
 from browser_use.telemetry.service import ProductTelemetry
 from browser_use.telemetry.views import AgentTelemetryEvent
 from browser_use.utils import (
 	_log_pretty_path,
 	get_browser_use_version,
-	handle_llm_error,
 	time_execution_async,
 	time_execution_sync,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _log_llm_capabilities(llm_service: Any) -> None:
+	"""Log the LLM capabilities for debugging."""
+	caps = llm_service.capabilities
+	tool_method = llm_service.get_tool_calling_method()
+
+	logger.info(
+		f"🧠 LLM Service initialized: {llm_service.library_name}/{llm_service.model_name}"
+		f" [vision: {caps.supports_vision}, tools: {caps.supports_tool_calling}]"
+		f" [method: {tool_method}]"
+	)
 
 
 def log_response(response: AgentOutput, registry=None, logger=None) -> None:
@@ -199,6 +205,13 @@ class Agent(Generic[Context]):
 		self.controller = controller
 		self.sensitive_data = sensitive_data
 
+		# Initialize LLM service for unified LLM handling
+		self.llm_service = LLMService(llm)
+
+		# Create extraction and planner LLM services
+		self.extraction_llm_service = LLMService(page_extraction_llm) if page_extraction_llm and page_extraction_llm != llm else self.llm_service
+		self.planner_llm_service = LLMService(planner_llm) if planner_llm else None
+
 		self.settings = AgentSettings(
 			use_vision=use_vision,
 			use_vision_for_planner=use_vision_for_planner,
@@ -238,30 +251,14 @@ class Agent(Generic[Context]):
 		self._set_browser_use_version_and_source(source)
 		self.initial_actions = self._convert_initial_actions(initial_actions) if initial_actions else None
 
-		# Model setup
-		self._set_model_names()
+		# Model setup using LLM service
+		self._setup_llm_capabilities()
 
-		# Verify we can connect to the LLM and setup the tool calling method
-		self._verify_and_setup_llm()
-
-		# Handle users trying to use use_vision=True with DeepSeek models
-		if 'deepseek' in self.model_name.lower():
-			self.logger.warning('⚠️ DeepSeek models do not support use_vision=True yet. Setting use_vision=False for now...')
-			self.settings.use_vision = False
-		if 'deepseek' in (self.planner_model_name or '').lower():
-			self.logger.warning(
-				'⚠️ DeepSeek models do not support use_vision=True yet. Setting use_vision_for_planner=False for now...'
-			)
-			self.settings.use_vision_for_planner = False
-		# Handle users trying to use use_vision=True with XAI models
-		if 'grok' in self.model_name.lower():
-			self.logger.warning('⚠️ XAI models do not support use_vision=True yet. Setting use_vision=False for now...')
-			self.settings.use_vision = False
-		if 'grok' in (self.planner_model_name or '').lower():
-			self.logger.warning(
-				'⚠️ XAI models do not support use_vision=True yet. Setting use_vision_for_planner=False for now...'
-			)
-			self.settings.use_vision_for_planner = False
+		# Override tool calling method if specified
+		if tool_calling_method != 'auto':
+			self.llm_service.set_tool_calling_method(tool_calling_method)
+			if self.planner_llm_service and self.planner_llm_service != self.llm_service:
+				self.planner_llm_service.set_tool_calling_method(tool_calling_method)
 
 		self.logger.info(
 			f'🧠 Starting a browser-use agent {self.version} with base_model={self.model_name}'
@@ -269,7 +266,7 @@ class Agent(Generic[Context]):
 			f'{" +rawtools" if self.tool_calling_method == "raw" else ""}'
 			f'{" +vision" if self.settings.use_vision else ""}'
 			f'{" +memory" if self.enable_memory else ""}'
-			f' extraction_model={getattr(self.settings.page_extraction_llm, "model_name", None)}'
+			f' extraction_model={self.extraction_llm_service.model_name}'
 			f'{f" planner_model={self.planner_model_name}" if self.planner_model_name else ""}'
 			f'{" +reasoning" if self.settings.is_planner_reasoning else ""}'
 			f'{" +vision" if self.settings.use_vision_for_planner else ""} '
@@ -279,8 +276,6 @@ class Agent(Generic[Context]):
 		# Initialize available actions for system prompt (only non-filtered actions)
 		# These will be used for the system prompt to maintain caching
 		self.unfiltered_actions = self.controller.registry.get_prompt_description()
-
-		self.settings.message_context = self._set_message_context()
 
 		# Initialize message manager with state
 		# Initial system prompt with all actions - will be updated during each step
@@ -464,6 +459,20 @@ class Agent(Generic[Context]):
 		_current_page_id = str(id(self.browser_session and self.browser_session.agent_current_page))[-2:]
 		return logging.getLogger(f'browser_use.Agent🅰 {self.task_id[-4:]} on 🆂 {_browser_session_id[-4:]}.{_current_page_id}')
 
+	def _set_file_system(self, file_system_path: str | None = None) -> None:
+		# Initialize file system
+		if file_system_path:
+			self.file_system = FileSystem(file_system_path)
+			self.file_system_path = file_system_path
+		else:
+			# create a temporary file system
+			base_tmp = tempfile.gettempdir()  # e.g., /tmp on Unix
+			self.file_system_path = os.path.join(base_tmp, str(uuid.uuid4()))
+			self.file_system = FileSystem(self.file_system_path)
+
+		logger.info(f'💾 File system path: {self.file_system_path}')
+
+
 	@property
 	def browser(self) -> Browser:
 		assert self.browser_session is not None, 'BrowserSession is not set up'
@@ -481,27 +490,25 @@ class Agent(Generic[Context]):
 		assert self.browser_session is not None, 'BrowserSession is not set up'
 		return self.browser_session.browser_profile
 
-	def _set_file_system(self, file_system_path: str | None = None) -> None:
-		# Initialize file system
-		if file_system_path:
-			self.file_system = FileSystem(file_system_path)
-			self.file_system_path = file_system_path
-		else:
-			# create a temporary file system
-			base_tmp = tempfile.gettempdir()  # e.g., /tmp on Unix
-			self.file_system_path = os.path.join(base_tmp, str(uuid.uuid4()))
-			self.file_system = FileSystem(self.file_system_path)
+	@property
+	def model_name(self) -> str:
+		"""Get the model name from LLM service."""
+		return self.llm_service.model_name
 
-		logger.info(f'💾 File system path: {self.file_system_path}')
+	@property
+	def chat_model_library(self) -> str:
+		"""Get the LLM library class name."""
+		return self.llm_service.library_name
 
-	def _set_message_context(self) -> str | None:
-		if self.tool_calling_method == 'raw':
-			# For raw tool calling, only include actions with no filters initially
-			if self.settings.message_context:
-				self.settings.message_context += f'\n\nAvailable actions: {self.unfiltered_actions}'
-			else:
-				self.settings.message_context = f'Available actions: {self.unfiltered_actions}'
-		return self.settings.message_context
+	@property
+	def tool_calling_method(self):
+		"""Get the tool calling method."""
+		return self.llm_service.get_tool_calling_method()
+
+	@property
+	def planner_model_name(self) -> str | None:
+		"""Get the planner model name."""
+		return self.planner_llm_service.model_name if self.planner_llm_service else None
 
 	def _set_browser_use_version_and_source(self, source_override: str | None = None) -> None:
 		"""Get the version from pyproject.toml and determine the source of the browser-use package"""
@@ -526,25 +533,25 @@ class Agent(Generic[Context]):
 		self.version = version
 		self.source = source
 
-	def _set_model_names(self) -> None:
-		self.chat_model_library = self.llm.__class__.__name__
-		self.model_name = 'Unknown'
-		if hasattr(self.llm, 'model_name'):
-			model = self.llm.model_name  # type: ignore
-			self.model_name = model if model is not None else 'Unknown'
-		elif hasattr(self.llm, 'model'):
-			model = self.llm.model  # type: ignore
-			self.model_name = model if model is not None else 'Unknown'
+	def _setup_llm_capabilities(self) -> None:
+		"""Setup LLM capabilities and handle model-specific limitations."""
+		# Adjust vision settings based on LLM capabilities
+		if not self.llm_service.supports_vision():
+			if self.settings.use_vision:
+				logger.warning(f'⚠️ {self.model_name} does not support vision. Setting use_vision=False...')
+				self.settings.use_vision = False
 
-		if self.settings.planner_llm:
-			if hasattr(self.settings.planner_llm, 'model_name'):
-				self.planner_model_name = self.settings.planner_llm.model_name  # type: ignore
-			elif hasattr(self.settings.planner_llm, 'model'):
-				self.planner_model_name = self.settings.planner_llm.model  # type: ignore
-			else:
-				self.planner_model_name = 'Unknown'
-		else:
-			self.planner_model_name = None
+		if self.planner_llm_service and not self.planner_llm_service.supports_vision():
+			if self.settings.use_vision_for_planner:
+				logger.warning(f'⚠️ {self.planner_model_name} does not support vision. Setting use_vision_for_planner=False...')
+				self.settings.use_vision_for_planner = False
+
+		_log_llm_capabilities(self.llm_service)
+
+		if self.planner_llm_service and self.planner_llm_service != self.llm_service:
+			logger.info(f"🧠 Planner LLM: {self.planner_llm_service.library_name}/{self.planner_llm_service.model_name}")
+		if self.extraction_llm_service != self.llm_service:
+			logger.info(f"🧠 Extraction LLM: {self.extraction_llm_service.library_name}/{self.extraction_llm_service.model_name}")
 
 	def _setup_action_models(self) -> None:
 		"""Setup dynamic action models from controller's registry"""
@@ -556,285 +563,6 @@ class Agent(Generic[Context]):
 		# used to force the done action when max_steps is reached
 		self.DoneActionModel = self.controller.registry.create_action_model(include_actions=['done'])
 		self.DoneAgentOutput = AgentOutput.type_with_custom_actions(self.DoneActionModel)
-
-	def _test_tool_calling_method(self, method: str | None) -> bool:
-		"""Test if a specific tool calling method works with the current LLM."""
-		try:
-			# Test configuration
-			CAPITAL_QUESTION = 'What is the capital of France? Respond with just the city name in lowercase.'
-			EXPECTED_ANSWER = 'paris'
-
-			class CapitalResponse(BaseModel):
-				"""Response model for capital city question"""
-
-				answer: str  # The name of the capital city in lowercase
-
-			def is_valid_raw_response(response, expected_answer: str) -> bool:
-				"""
-				Cleans and validates a raw JSON response string against an expected answer.
-				"""
-				content = getattr(response, 'content', '').strip()
-				# self.logger.debug(f'Raw response content: {content}')
-
-				# Remove surrounding markdown code blocks if present
-				if content.startswith('```json') and content.endswith('```'):
-					content = content[7:-3].strip()
-				elif content.startswith('```') and content.endswith('```'):
-					content = content[3:-3].strip()
-
-				# Attempt to parse and validate the answer
-				try:
-					result = json.loads(content)
-					answer = str(result.get('answer', '')).strip().lower().strip(' .')
-
-					if expected_answer.lower() not in answer:
-						self.logger.debug(f"🛠️ Tool calling method {method} failed: expected '{expected_answer}', got '{answer}'")
-						return False
-
-					return True
-
-				except (json.JSONDecodeError, AttributeError, TypeError) as e:
-					self.logger.debug(f'🛠️ Tool calling method {method} failed: Failed to parse JSON content: {e}')
-					return False
-
-			if method == 'raw' or method == 'json_mode':
-				# For raw mode, test JSON response format
-				test_prompt = f"""{CAPITAL_QUESTION}
-					Respond with a json object like: {{"answer": "city_name_in_lowercase"}}"""
-
-				response = self.llm.invoke([test_prompt])
-				# Basic validation of response
-				if not response or not hasattr(response, 'content'):
-					return False
-
-				if not is_valid_raw_response(response, EXPECTED_ANSWER):
-					return False
-				return True
-			else:
-				# For other methods, try to use structured output
-				structured_llm = self.llm.with_structured_output(CapitalResponse, include_raw=True, method=method)
-				response = structured_llm.invoke([HumanMessage(content=CAPITAL_QUESTION)])
-
-				if not response:
-					self.logger.debug(f'🛠️ Tool calling method {method} failed: empty response')
-					return False
-
-				def extract_parsed(response: Any) -> CapitalResponse | None:
-					if isinstance(response, dict):
-						return response.get('parsed')
-					return getattr(response, 'parsed', None)
-
-				parsed = extract_parsed(response)
-
-				if not isinstance(parsed, CapitalResponse):
-					self.logger.debug(f'🛠️ Tool calling method {method} failed: LLM responded with invalid JSON')
-					return False
-
-				if EXPECTED_ANSWER not in parsed.answer.lower():
-					self.logger.debug(f'🛠️ Tool calling method {method} failed: LLM failed to answer test question correctly')
-					return False
-				return True
-
-		except Exception as e:
-			self.logger.debug(f"🛠️ Tool calling method '{method}' test failed: {type(e).__name__}: {str(e)}")
-			return False
-
-	async def _test_tool_calling_method_async(self, method: str) -> tuple[str, bool]:
-		"""Test if a specific tool calling method works with the current LLM (async version)."""
-		# Run the synchronous test in a thread pool to avoid blocking
-		loop = asyncio.get_event_loop()
-		result = await loop.run_in_executor(None, self._test_tool_calling_method, method)
-		return (method, result)
-
-	def _detect_best_tool_calling_method(self) -> str | None:
-		"""Detect the best supported tool calling method by testing each one."""
-		start_time = time.time()
-
-		# Order of preference for tool calling methods
-		methods_to_try = [
-			'function_calling',  # Most capable and efficient
-			'tools',  # Works with some models that don't support function_calling
-			'json_mode',  # More basic structured output
-			'raw',  # Fallback - no tool calling support
-		]
-
-		# Try parallel testing for faster detection
-		try:
-			# Run async parallel tests
-			async def test_all_methods():
-				tasks = [self._test_tool_calling_method_async(method) for method in methods_to_try]
-				results = await asyncio.gather(*tasks, return_exceptions=True)
-				return results
-
-			# Execute async tests
-			try:
-				loop = asyncio.get_running_loop()
-				# Running loop: create a new loop in a separate thread
-				result = {}
-
-				def run_in_thread():
-					new_loop = asyncio.new_event_loop()
-					asyncio.set_event_loop(new_loop)
-					try:
-						result['value'] = new_loop.run_until_complete(test_all_methods())
-					except Exception as e:
-						result['error'] = e
-					finally:
-						new_loop.close()
-
-				t = Thread(target=run_in_thread)
-				t.start()
-				t.join()
-				if 'error' in result:
-					raise result['error']
-				results = result['value']
-
-			except RuntimeError as e:
-				if 'no running event loop' in str(e):
-					results = asyncio.run(test_all_methods())
-				else:
-					raise
-
-			# Process results in order of preference
-			for i, method in enumerate(methods_to_try):
-				if not isinstance(results, list):
-					continue
-				ith_result = results[i]
-				if isinstance(ith_result, tuple) and ith_result[1]:  # (method, success)
-					setattr(self.llm, '_verified_api_keys', True)
-					setattr(self.llm, '_verified_tool_calling_method', method)  # Cache on LLM instance
-					elapsed = time.time() - start_time
-					self.logger.debug(f'🛠️ Tested LLM in parallel and chose tool calling method: [{method}] in {elapsed:.2f}s')
-					return method
-
-		except Exception as e:
-			self.logger.debug(f'Parallel testing failed: {e}, falling back to sequential')
-			# Fall back to sequential testing
-			for method in methods_to_try:
-				if self._test_tool_calling_method(method):
-					# if we found the method which means api is verified.
-					setattr(self.llm, '_verified_api_keys', True)
-					setattr(self.llm, '_verified_tool_calling_method', method)  # Cache on LLM instance
-					elapsed = time.time() - start_time
-					self.logger.debug(f'🛠️ Tested LLM and chose tool calling method: [{method}] in {elapsed:.2f}s')
-					return method
-
-		# If we get here, no methods worked
-		raise ConnectionError('Failed to connect to LLM. Please check your API key and network connection.')
-
-	def _get_known_tool_calling_method(self) -> str | None:
-		"""Get known tool calling method for common model/library combinations."""
-		# Fast path for known combinations
-		model_lower = self.model_name.lower()
-
-		# OpenAI models
-		if self.chat_model_library == 'ChatOpenAI':
-			if any(m in model_lower for m in ['gpt-4', 'gpt-3.5']):
-				return 'function_calling'
-			if any(m in model_lower for m in ['llama-4', 'llama-3']):
-				return 'function_calling'
-
-		elif self.chat_model_library == 'ChatGroq':
-			if any(m in model_lower for m in ['llama-4', 'llama-3']):
-				return 'function_calling'
-
-		# Azure OpenAI models
-		elif self.chat_model_library == 'AzureChatOpenAI':
-			if 'gpt-4-' in model_lower:
-				return 'tools'
-			else:
-				return 'function_calling'
-
-		# Google models
-		elif self.chat_model_library == 'ChatGoogleGenerativeAI':
-			return None  # Google uses native tool support
-
-		# Anthropic models
-		elif self.chat_model_library in ['ChatAnthropic', 'AnthropicChat']:
-			if any(m in model_lower for m in ['claude-3', 'claude-2']):
-				return 'tools'
-
-		# Models known to not support tools
-		elif is_model_without_tool_support(self.model_name):
-			return 'raw'
-
-		return None  # Unknown combination, needs testing
-
-	def _set_tool_calling_method(self) -> ToolCallingMethod | None:
-		"""Determine the best tool calling method to use with the current LLM."""
-
-		# old hardcoded logic
-		# 			if is_model_without_tool_support(self.model_name):
-		# 				return 'raw'
-		# 			elif self.chat_model_library == 'ChatGoogleGenerativeAI':
-		# 				return None
-		# 			elif self.chat_model_library == 'ChatOpenAI':
-		# 				return 'function_calling'
-		# 			elif self.chat_model_library == 'AzureChatOpenAI':
-		# 				# Azure OpenAI API requires 'tools' parameter for GPT-4
-		# 				# The error 'content must be either a string or an array' occurs when
-		# 				# the API expects a tools array but gets something else
-		# 				if 'gpt-4-' in self.model_name.lower():
-		# 					return 'tools'
-		# 				else:
-		# 					return 'function_calling'
-
-		# If a specific method is set, use it
-		if self.settings.tool_calling_method != 'auto':
-			# Skip test if already verified
-			if getattr(self.llm, '_verified_api_keys', None) is True or CONFIG.SKIP_LLM_API_KEY_VERIFICATION:
-				setattr(self.llm, '_verified_api_keys', True)
-				setattr(self.llm, '_verified_tool_calling_method', self.settings.tool_calling_method)
-				return self.settings.tool_calling_method
-
-			if not self._test_tool_calling_method(self.settings.tool_calling_method):
-				if self.settings.tool_calling_method == 'raw':
-					# if raw failed means error in API key or network connection
-					raise ConnectionError('Failed to connect to LLM. Please check your API key and network connection.')
-				else:
-					raise RuntimeError(
-						f"Configured tool calling method '{self.settings.tool_calling_method}' "
-						'is not supported by the current LLM.'
-					)
-			setattr(self.llm, '_verified_tool_calling_method', self.settings.tool_calling_method)
-			return self.settings.tool_calling_method
-
-		# Check if we already have a cached method on this LLM instance
-		if hasattr(self.llm, '_verified_tool_calling_method'):
-			self.logger.debug(
-				f'🛠️ Using cached tool calling method for {self.chat_model_library}/{self.model_name}: [{getattr(self.llm, "_verified_tool_calling_method")}]'
-			)
-			return getattr(self.llm, '_verified_tool_calling_method')
-
-		# Try fast path for known model/library combinations
-		known_method = self._get_known_tool_calling_method()
-		if known_method is not None:
-			# Trust known combinations without testing if verification is already done or skipped
-			if getattr(self.llm, '_verified_api_keys', None) is True or CONFIG.SKIP_LLM_API_KEY_VERIFICATION:
-				setattr(self.llm, '_verified_api_keys', True)
-				setattr(self.llm, '_verified_tool_calling_method', known_method)  # Cache on LLM instance
-				self.logger.debug(
-					f'🛠️ Using known tool calling method for {self.chat_model_library}/{self.model_name}: [{known_method}] (skipped test)'
-				)
-				return known_method  # type: ignore
-
-			start_time = time.time()
-			# Verify the known method works
-			if self._test_tool_calling_method(known_method):
-				setattr(self.llm, '_verified_api_keys', True)
-				setattr(self.llm, '_verified_tool_calling_method', known_method)  # Cache on LLM instance
-				elapsed = time.time() - start_time
-				self.logger.debug(
-					f'🛠️ Using known tool calling method for {self.chat_model_library}/{self.model_name}: [{known_method}] in {elapsed:.2f}s'
-				)
-				return known_method  # type: ignore
-			# If known method fails, fall back to detection
-			self.logger.debug(
-				f'Known method {known_method} failed for {self.chat_model_library}/{self.model_name}, falling back to detection'
-			)
-
-		# Auto-detect the best method
-		return self._detect_best_tool_calling_method()  # type: ignore
 
 	def add_new_task(self, new_task: str) -> None:
 		"""Add a new task to the agent, keeping the same task_id as tasks are continuous"""
@@ -887,23 +615,6 @@ class Agent(Generic[Context]):
 			if page_filtered_actions:
 				page_action_message = f'For this page, these additional actions are available:\n{page_filtered_actions}'
 				self._message_manager._add_message_with_tokens(HumanMessage(content=page_action_message))
-
-			# If using raw tool calling method, we need to update the message context with new actions
-			if self.tool_calling_method == 'raw':
-				# For raw tool calling, get all non-filtered actions plus the page-filtered ones
-				all_unfiltered_actions = self.controller.registry.get_prompt_description()
-				all_actions = all_unfiltered_actions
-				if page_filtered_actions:
-					all_actions += '\n' + page_filtered_actions
-
-				context_lines = (self._message_manager.settings.message_context or '').split('\n')
-				non_action_lines = [line for line in context_lines if not line.startswith('Available actions:')]
-				updated_context = '\n'.join(non_action_lines)
-				if updated_context:
-					updated_context += f'\n\nAvailable actions: {all_actions}'
-				else:
-					updated_context = f'Available actions: {all_actions}'
-				self._message_manager.settings.message_context = updated_context
 
 			self._message_manager.add_state_message(
 				browser_state_summary=browser_state_summary,
@@ -1133,96 +844,23 @@ class Agent(Generic[Context]):
 
 		self.state.history.history.append(history_item)
 
-	THINK_TAGS = re.compile(r'<think>.*?</think>', re.DOTALL)
-	STRAY_CLOSE_TAG = re.compile(r'.*?</think>', re.DOTALL)
 
-	def _remove_think_tags(self, text: str) -> str:
-		# Step 1: Remove well-formed <think>...</think>
-		text = re.sub(self.THINK_TAGS, '', text)
-		# Step 2: If there's an unmatched closing tag </think>,
-		#         remove everything up to and including that.
-		text = re.sub(self.STRAY_CLOSE_TAG, '', text)
-		return text.strip()
-
-	def _convert_input_messages(self, input_messages: list[BaseMessage]) -> list[BaseMessage]:
-		"""Convert input messages to the correct format"""
-		if is_model_without_tool_support(self.model_name):
-			return convert_input_messages(input_messages, self.model_name)
-		else:
-			return input_messages
 
 	@time_execution_async('--get_next_action')
 	async def get_next_action(self, input_messages: list[BaseMessage]) -> AgentOutput:
 		"""Get next action from LLM based on current state"""
-		input_messages = self._convert_input_messages(input_messages)
 
-		if self.tool_calling_method == 'raw':
-			self._log_llm_call_info(input_messages, self.tool_calling_method)
-			try:
-				output = await self.llm.ainvoke(input_messages)
-				response = {'raw': output, 'parsed': None}
-			except Exception as e:
-				self.logger.error(f'Failed to invoke model: {str(e)}')
-				# Extract status code if available (e.g., from HTTP exceptions)
-				status_code = getattr(e, 'status_code', None) or getattr(e, 'code', None) or 500
-				error_msg = f'LLM API call failed: {type(e).__name__}: {str(e)}'
-				raise LLMException(status_code, error_msg) from e
-			# TODO: currently invoke does not return reasoning_content, we should override invoke
-			output.content = self._remove_think_tags(str(output.content))
-			try:
-				parsed_json = extract_json_from_model_output(output.content)
-				parsed = self.AgentOutput(**parsed_json)
-				response['parsed'] = parsed
-			except (ValueError, ValidationError) as e:
-				logger.warning(f'Failed to parse model output: {output} {str(e)}')
-				raise ValueError('Could not parse response.' + str(e))
+		self._log_llm_call_info(input_messages, self.tool_calling_method)
 
-		elif self.tool_calling_method is None:
-			structured_llm = self.llm.with_structured_output(self.AgentOutput, include_raw=True)
-			try:
-				response: dict[str, Any] = await structured_llm.ainvoke(input_messages)  # type: ignore
-				parsed: AgentOutput | None = response['parsed']
-
-			except Exception as e:
-				response, raw = handle_llm_error(e)
-
-		else:
-			try:
-				self._log_llm_call_info(input_messages, self.tool_calling_method)
-				structured_llm = self.llm.with_structured_output(
-					self.AgentOutput, include_raw=True, method=self.tool_calling_method
-				)
-				response: dict[str, Any] = await structured_llm.ainvoke(input_messages)  # type: ignore
-			except Exception as e:
-				response, raw = handle_llm_error(e)
-
-		# Handle tool call responses
-		if response.get('parsing_error') and 'raw' in response:
-			raw_msg = response['raw']
-			parsing_error = response.get('parsing_error')
-			if hasattr(raw_msg, 'tool_calls') and raw_msg.tool_calls:
-				# Convert tool calls to AgentOutput format
-				tool_call = raw_msg.tool_calls[0]  # Take first tool call
-				tool_call_args = tool_call['args']
-				parsed = self.AgentOutput(**tool_call_args)
-
-				try:
-					action = parsed.action[0].model_dump(exclude_unset=True)
-				except Exception as e:
-					raise ValueError(f'Could not parse response. {parsing_error} tried to parse {response["raw"]} to {parsed}')
-
-			else:
-				parsed = None
-		else:
-			parsed = response['parsed']
-
-		if not parsed:
-			try:
-				parsed_json = extract_json_from_model_output(response['raw'])
-				parsed = self.AgentOutput(**parsed_json)
-			except Exception as e:
-				logger.warning(f'Failed to parse model output: {response["raw"]} {str(e)}')
-				raise ValueError(f'Could not parse response. {str(e)}')
+		try:
+			# Use the unified LLM service to get structured output
+			parsed = await self.llm_service.get_structured_output(
+				messages=input_messages,
+				output_schema=self.AgentOutput
+			)
+		except Exception as e:
+			logger.error(f'Failed to get structured output from LLM: {str(e)}')
+			raise LLMException(401, 'LLM API call failed') from e
 
 		# cut the number of actions to max_actions_per_step if needed
 		if len(parsed.action) > self.settings.max_actions_per_step:
@@ -1332,10 +970,10 @@ class Agent(Generic[Context]):
 		image_status = ', 📷 img' if has_images else ''
 		if method == 'raw':
 			output_format = '=> raw text'
-			tool_info = ''
 		else:
 			output_format = '=> JSON out'
-			tool_info = f' + 🔨 {tool_count} tools ({method})'
+
+		tool_info = f' + 🔨 {tool_count} tools ({method})'
 
 		term_width = shutil.get_terminal_size((80, 20)).columns
 		print('=' * term_width)
@@ -1915,22 +1553,11 @@ class Agent(Generic[Context]):
 
 		return converted_actions
 
-	def _verify_and_setup_llm(self):
-		"""
-		Verify that the LLM API keys are setup and the LLM API is responding properly.
-		Also handles tool calling method detection if in auto mode.
-		"""
-		self.tool_calling_method = self._set_tool_calling_method()
-
-		# Skip verification if already done
-		if getattr(self.llm, '_verified_api_keys', None) is True or CONFIG.SKIP_LLM_API_KEY_VERIFICATION:
-			setattr(self.llm, '_verified_api_keys', True)
-			return True
 
 	async def _run_planner(self) -> str | None:
 		"""Run the planner to analyze state and suggest next steps"""
-		# Skip planning if no planner_llm is set
-		if not self.settings.planner_llm:
+		# Skip planning if no planner LLM service is set
+		if not self.planner_llm_service:
 			return None
 
 		# Get current state to filter actions by page
@@ -1970,24 +1597,17 @@ class Agent(Generic[Context]):
 
 			planner_messages[-1] = HumanMessage(content=new_msg)
 
-		planner_messages = convert_input_messages(planner_messages, self.planner_model_name)
 
-		# Get planner output
+		# Get planner output using LLM service
 		try:
-			response = await self.settings.planner_llm.ainvoke(planner_messages)
+			plan = await self.planner_llm_service.get_raw_output(planner_messages)
 		except Exception as e:
-			self.logger.error(f'Failed to invoke planner: {str(e)}')
+			logger.error(f'Failed to invoke planner: {str(e)}')
 			# Extract status code if available (e.g., from HTTP exceptions)
 			status_code = getattr(e, 'status_code', None) or getattr(e, 'code', None) or 500
 			error_msg = f'Planner LLM API call failed: {type(e).__name__}: {str(e)}'
 			raise LLMException(status_code, error_msg) from e
 
-		plan = str(response.content)
-		# if deepseek-reasoner, remove think tags
-		if self.planner_model_name and (
-			'deepseek-r1' in self.planner_model_name or 'deepseek-reasoner' in self.planner_model_name
-		):
-			plan = self._remove_think_tags(plan)
 		try:
 			plan_json = json.loads(plan)
 			self.logger.info(f'Planning Analysis:\n{json.dumps(plan_json, indent=4)}')
